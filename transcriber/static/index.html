@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<!--
+  index.html — LiveVoice Frontend
+  ================================
+  Served by FastAPI at GET /
+
+  Libraries used (all via CDN, no build step needed)
+  ---------------------------------------------------
+  • Tailwind CSS  — utility-class styling, no custom CSS needed
+  • Lucide Icons  — clean SVG icon set, loaded as a JS library
+
+  JavaScript is split into clearly labelled sections:
+  ────────────────────────────────────────────────────
+  § CONFIG          — tunable constants at the top
+  § WEBSOCKET       — connect to the server and receive transcript text
+  § AUDIO CAPTURE   — request mic, record in chunks, POST to /transcribe
+  § WAVEFORM        — canvas-based mic level visualiser
+  § UI              — DOM helpers: append text, timestamps, status badge
+  § INIT            — wire everything together on page load
+-->
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LiveVoice</title>
+
+  <!-- Tailwind CSS — utility classes like "flex", "text-sm", "bg-zinc-900" -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Lucide Icons — gives us window.lucide.createIcons() -->
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+
+  <!-- Tailwind config: extend with our custom dark palette -->
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"IBM Plex Sans"', 'sans-serif'],
+            mono: ['"IBM Plex Mono"', 'monospace'],
+          },
+          colors: {
+            surface: '#111114',
+            panel:   '#18181c',
+            border:  '#2a2a30',
+            accent:  '#a78bfa',   /* soft violet */
+            dim:     '#6b6b80',
+          },
+          animation: {
+            'pulse-ring': 'pulseRing 1.5s ease-out infinite',
+            'fade-up':    'fadeUp 0.2s ease forwards',
+          },
+          keyframes: {
+            pulseRing: {
+              '0%':   { transform: 'scale(1)',    opacity: '0.6' },
+              '100%': { transform: 'scale(1.55)', opacity: '0'   },
+            },
+            fadeUp: {
+              from: { opacity: '0', transform: 'translateY(6px)' },
+              to:   { opacity: '1', transform: 'translateY(0)'   },
+            },
+          },
+        },
+      },
+    }
+  </script>
+
+  <!-- IBM Plex fonts — monospace feels right for a transcription tool -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+
+  <style>
+    /*
+      A few things Tailwind can't do easily via classes alone.
+      Kept minimal — everything else uses Tailwind utilities.
+    */
+
+    /* Thin scrollbar so the transcript pane doesn't look clunky */
+    #transcript-pane::-webkit-scrollbar { width: 4px; }
+    #transcript-pane::-webkit-scrollbar-track { background: transparent; }
+    #transcript-pane::-webkit-scrollbar-thumb { background: #2a2a30; border-radius: 2px; }
+
+    /* The blinking cursor shown while "transcribing…" is displayed */
+    .cursor-blink::after {
+      content: '▋';
+      animation: blink 0.8s step-end infinite;
+      margin-left: 2px;
+      color: #a78bfa;
+    }
+    @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+  </style>
+</head>
+
+<body class="h-full bg-surface text-zinc-100 font-sans antialiased">
+
+  <!--
+    ═══════════════════════════════════════════════════════
+    LAYOUT — three-row grid: header | transcript | controls
+    ═══════════════════════════════════════════════════════
+  -->
+  <div class="flex flex-col h-full max-w-2xl mx-auto px-6">
+
+    <!-- ── Header ─────────────────────────────────────────────────────────── -->
+    <header class="flex items-center justify-between py-5 border-b border-border shrink-0">
+      <div class="flex items-center gap-2.5">
+        <!-- Lucide "radio" icon — data-lucide triggers lucide.createIcons() -->
+        <i data-lucide="radio" class="w-4 h-4 text-accent" aria-hidden="true"></i>
+        <span class="text-sm font-mono font-medium tracking-widest uppercase text-zinc-400">
+          LiveVoice
+        </span>
+      </div>
+
+      <!--
+        Status pill — updated by JS setStatus().
+        Three states: idle (gray) | connecting (amber) | connected (green)
+      -->
+      <div id="status-badge"
+           class="flex items-center gap-2 text-xs font-mono text-dim transition-colors duration-300">
+        <span id="status-dot" class="w-1.5 h-1.5 rounded-full bg-dim transition-colors duration-300"></span>
+        <span id="status-text">not connected</span>
+      </div>
+    </header>
+
+    <!-- ── Transcript pane ────────────────────────────────────────────────── -->
+    <!--
+      overflow-y-auto + flex-1 = pane takes all available vertical space
+      and scrolls internally.  New segments are appended and we call
+      scrollTop = scrollHeight to keep the latest line in view.
+    -->
+    <main id="transcript-pane" class="flex-1 overflow-y-auto py-6 flex flex-col gap-0">
+
+      <!-- Empty state — hidden once the first transcript arrives -->
+      <div id="empty-state" class="m-auto text-center text-dim">
+        <i data-lucide="mic" class="w-10 h-10 mx-auto mb-4 opacity-20" aria-hidden="true"></i>
+        <p class="text-sm tracking-wide">press the mic and start speaking</p>
+      </div>
+
+      <!--
+        Transcript segments are injected here by appendSegment() and showPartial().
+        Each segment looks like:
+          <div class="seg ...">
+            <span class="seg-time ...">HH:MM:SS</span>
+            <span class="seg-text ...">transcribed words</span>
+          </div>
+      -->
+    </main>
+
+    <!-- ── Waveform canvas ────────────────────────────────────────────────── -->
+    <!--
+      Drawn by the waveform module below.
+      Opacity is toggled via JS: waveCanvas.classList.add/remove('opacity-0')
+    -->
+    <canvas id="waveform"
+            class="w-full h-10 opacity-0 transition-opacity duration-500 shrink-0">
+    </canvas>
+
+    <!-- ── Footer controls ───────────────────────────────────────────────── -->
+    <footer class="flex items-center justify-between py-5 border-t border-border shrink-0">
+
+      <!-- Left side: current recording duration or idle hint -->
+      <span id="hint-left" class="text-xs font-mono text-dim w-24 text-right"></span>
+
+      <!--
+        Mic button — the main interaction.
+        Click toggles recording on/off.
+        .recording class (added by JS) switches styles to red + ripple animation.
+      -->
+      <div class="relative flex items-center justify-center">
+        <!-- Ripple ring: visible only when .recording is present on the button -->
+        <span id="mic-ring"
+              class="absolute w-16 h-16 rounded-full border border-red-500 opacity-0
+                     scale-100 pointer-events-none"></span>
+
+        <button id="mic-btn"
+                aria-label="Start recording"
+                class="relative z-10 w-14 h-14 rounded-full border border-border bg-panel
+                       flex items-center justify-center
+                       hover:border-zinc-500 hover:bg-zinc-800
+                       active:scale-95 transition-all duration-150 focus:outline-none
+                       focus-visible:ring-2 focus-visible:ring-accent">
+          <i data-lucide="mic" id="mic-icon" class="w-5 h-5 text-zinc-300" aria-hidden="true"></i>
+        </button>
+      </div>
+
+      <!-- Right side: tap-to-record hint + clear button -->
+      <div class="flex flex-col items-start gap-2 w-24">
+        <span id="hint-right" class="text-xs font-mono text-dim">tap to record</span>
+        <button id="clear-btn"
+                class="text-xs font-mono text-dim border border-border rounded-full
+                       px-3 py-1 hover:border-zinc-500 hover:text-zinc-300 transition-all">
+          clear
+        </button>
+      </div>
+
+    </footer>
+  </div><!-- end .flex.flex-col -->
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       JAVASCRIPT — split into clearly labelled sections
+       ══════════════════════════════════════════════════════════════════════ -->
+  <script>
+  "use strict";
+
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │  § CONFIG                                                        │
+  // │  Tune these without touching anything else.                      │
+  // └─────────────────────────────────────────────────────────────────┘
+
+  const CONFIG = {
+    // How many seconds of audio to batch before sending to /transcribe.
+    // Lower = more responsive but more API calls; higher = fewer calls but lag.
+    chunkSeconds: 2.5,
+
+    // Milliseconds to pause between stopping one chunk and starting the next.
+    // Gives MediaRecorder time to fire its final ondataavailable event.
+    chunkGapMs: 80,
+
+    // URL of the WebSocket endpoint on the server.
+    // location.host is e.g. "localhost:8000" — works locally and on LAN.
+    wsUrl: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
+
+    // POST endpoint for audio upload
+    transcribeUrl: "/transcribe",
+  };
+
+
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │  § WEBSOCKET                                                     │
+  // │  Connect to the server; receive transcript text pushed by        │
+  // │  /transcribe after Groq returns a result.                        │
+  // └─────────────────────────────────────────────────────────────────┘
+
+  const WSClient = (() => {
+    let socket = null;
+
+    /**
+     * Open a WebSocket connection.
+     * On close, waits 2 s then reconnects automatically (handles server restarts,
+     * brief network drops, etc).
+     */
+    function connect() {
+      UI.setStatus("connecting", "connecting…");
+      socket = new WebSocket(CONFIG.wsUrl);
+
+      socket.onopen = () => {
+        UI.setStatus("connected", "connected");
+      };
+
+      socket.onmessage = (event) => {
+        // The server sends raw transcript text — just append it.
+        const text = event.data.trim();
+        if (text) {
+          UI.clearPartial();         // remove the "transcribing…" placeholder
+          UI.appendSegment(text);    // add the real transcript line
+        }
+      };
+
+      socket.onclose = () => {
+        UI.setStatus("idle", "reconnecting…");
+        setTimeout(connect, 2000);  // auto-reconnect after 2 s
+      };
+
+      socket.onerror = () => {
+        UI.setStatus("error", "connection error");
+      };
+    }
+
+    return { connect };
+  })();
+
+
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │  § AUDIO CAPTURE                                                 │
+  // │  Request microphone access, record in timed chunks, POST each   │
+  // │  chunk to /transcribe.                                           │
+  // └─────────────────────────────────────────────────────────────────┘
+
+  const AudioCapture = (() => {
+    let mediaRecorder = null;    // MediaRecorder instance
+    let audioChunks   = [];      // accumulates Blob pieces from ondataavailable
+    let stream        = null;    // MediaStream (microphone)
+    let isRecording   = false;
+    let sliceTimer    = null;    // setInterval handle for chunk slicing
+
+    /**
+     * Start recording.
+     * 1. Ask the browser for microphone permission.
+     * 2. Create a MediaRecorder on the stream.
+     * 3. Every chunkSeconds, stop → send → restart the recorder.
+     */
+    async function start() {
+      if (isRecording) return;
+
+      // Request mic — browser shows the permission popup if needed.
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch {
+        UI.setHint("right", "mic denied");
+        return;
+      }
+
+      isRecording = true;
+      UI.onRecordingStart(stream);
+
+      // Pick the best supported MIME type.
+      // opus inside webm has the best compression/quality for voice.
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
+
+      mediaRecorder = new MediaRecorder(stream, { mimeType });
+      audioChunks = [];
+
+      // ondataavailable fires when recorder.stop() is called (or on timeslice).
+      // We push each Blob piece into audioChunks; they're joined in sendChunk().
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunks.push(e.data);
+      };
+
+      // onstop fires after the recorder finishes writing.
+      // This is when we have a complete audio blob ready to send.
+      mediaRecorder.onstop = () => {
+        if (audioChunks.length === 0) return;
+
+        // Join all pieces into one Blob, then clear the buffer.
+        const blob = new Blob(audioChunks, { type: mimeType });
+        audioChunks = [];
+
+        sendChunk(blob, mimeType);
+      };
+
+      mediaRecorder.start();
+
+      // Slice the recording into chunks every chunkSeconds.
+      // stop() triggers onstop → sendChunk, then we restart.
+      sliceTimer = setInterval(() => {
+        if (!isRecording || !mediaRecorder) return;
+        if (mediaRecorder.state === "recording") {
+          mediaRecorder.stop();
+          setTimeout(() => {
+            if (isRecording) {
+              audioChunks = [];
+              mediaRecorder.start();
+            }
+          }, CONFIG.chunkGapMs);
+        }
+      }, CONFIG.chunkSeconds * 1000);
+    }
+
+    /**
+     * Stop recording and clean up resources.
+     */
+    function stop() {
+      if (!isRecording) return;
+      isRecording = false;
+
+      clearInterval(sliceTimer);
+
+      // Stop the recorder (triggers one final onstop → sendChunk)
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+
+      // Release the microphone — the browser removes the red dot.
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+        stream = null;
+      }
+
+      UI.onRecordingStop();
+    }
+
+    /**
+     * POST an audio blob to /transcribe.
+     * The server calls Groq Whisper and then pushes the result back
+     * over the WebSocket, so we only need to show a "transcribing…"
+     * placeholder here; we don't process the POST response body.
+     */
+    async function sendChunk(blob, mimeType) {
+      UI.showPartial("transcribing…");
+
+      const formData = new FormData();
+      // Server expects the field name "audio"
+      formData.append("audio", blob, "audio.webm");
+
+      try {
+        const response = await fetch(CONFIG.transcribeUrl, {
+          method: "POST",
+          body: formData,
+          // Note: do NOT set Content-Type header manually —
+          // the browser sets it automatically with the correct boundary string.
+        });
+        const data = await response.json();
+
+        if (data.error) {
+          UI.clearPartial();
+          console.error("[transcribe]", data.error);
+        }
+        // On success: the text arrives via WebSocket (server broadcasts it).
+        // The WS handler calls UI.clearPartial() + UI.appendSegment() there.
+
+      } catch (err) {
+        UI.clearPartial();
+        console.error("[transcribe] network error:", err);
+      }
+    }
+
+    function toggle() {
+      isRecording ? stop() : start();
+    }
+
+    return { start, stop, toggle, get isRecording() { return isRecording; } };
+  })();
+
+
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │  § WAVEFORM                                                      │
+  // │  Draws a real-time oscilloscope of the mic signal on a canvas.  │
+  // │  Purely cosmetic — shows the user the mic is active.            │
+  // └─────────────────────────────────────────────────────────────────┘
+
+  const Waveform = (() => {
+    const canvas  = document.getElementById("waveform");
+    const ctx     = canvas.getContext("2d");
+    let rafHandle = null;   // requestAnimationFrame ID for cancellation
+    let analyser  = null;   // Web Audio AnalyserNode
+    let audioCtx  = null;   // AudioContext
+
+    /** Call once when recording starts; pass the MediaStream. */
+    function start(stream) {
+      // Resize canvas to match its CSS width
+      canvas.width  = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+
+      // Web Audio pipeline:  microphone stream → analyser (no output)
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;  // bigger = more detail, but more CPU
+      audioCtx.createMediaStreamSource(stream).connect(analyser);
+
+      canvas.classList.remove("opacity-0");
+      canvas.classList.add("opacity-100");
+      _draw();
+    }
+
+    /** Call when recording stops to cancel animation and clear the canvas. */
+    function stop() {
+      cancelAnimationFrame(rafHandle);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.classList.remove("opacity-100");
+      canvas.classList.add("opacity-0");
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    }
+
+    /** Internal draw loop — called ~60 fps by rAF. */
+    function _draw() {
+      rafHandle = requestAnimationFrame(_draw);
+
+      const buffer = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteTimeDomainData(buffer);  // fills buffer with waveform data
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(167,139,250,0.35)"; // soft violet to match accent color
+      ctx.lineWidth   = 1.5;
+
+      const sliceWidth = canvas.width / buffer.length;
+      let x = 0;
+
+      for (let i = 0; i < buffer.length; i++) {
+        // buffer[i] is 0–255; 128 = silence (centre line)
+        // Map to canvas y-coordinate
+        const y = (buffer[i] / 128) * (canvas.height / 2);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        x += sliceWidth;
+      }
+
+      ctx.stroke();
+    }
+
+    return { start, stop };
+  })();
+
+
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │  § UI                                                            │
+  // │  All DOM reads/writes are here.  Other modules call UI.*()      │
+  // │  rather than touching the DOM directly.                          │
+  // └─────────────────────────────────────────────────────────────────┘
+
+  const UI = (() => {
+    // Cache DOM references once — cheaper than getElementById each time
+    const pane        = document.getElementById("transcript-pane");
+    const emptyState  = document.getElementById("empty-state");
+    const micBtn      = document.getElementById("mic-btn");
+    const micIcon     = document.getElementById("mic-icon");
+    const micRing     = document.getElementById("mic-ring");
+    const hintLeft    = document.getElementById("hint-left");
+    const hintRight   = document.getElementById("hint-right");
+    const clearBtn    = document.getElementById("clear-btn");
+    const statusDot   = document.getElementById("status-dot");
+    const statusTxt   = document.getElementById("status-text");
+
+    let partialEl = null;  // reference to the current "transcribing…" element
+
+    // ── Status badge ────────────────────────────────────────────────────────
+
+    const STATUS_STYLES = {
+      idle:        { dot: "bg-dim",       text: "text-dim"        },
+      connecting:  { dot: "bg-amber-400", text: "text-amber-400"  },
+      connected:   { dot: "bg-emerald-400 animate-pulse", text: "text-emerald-400" },
+      error:       { dot: "bg-red-500",   text: "text-red-500"    },
+    };
+
+    function setStatus(state, label) {
+      const style = STATUS_STYLES[state] || STATUS_STYLES.idle;
+      statusDot.className = `w-1.5 h-1.5 rounded-full transition-colors duration-300 ${style.dot}`;
+      statusTxt.textContent = label;
+      statusTxt.className   = `font-mono text-xs transition-colors duration-300 ${style.text}`;
+    }
+
+    // ── Transcript segments ──────────────────────────────────────────────────
+
+    /** Format the current time as HH:MM:SS */
+    function _timestamp() {
+      return new Date().toTimeString().slice(0, 8);
+    }
+
+    /** Escape < > & so raw text is safe to inject as innerHTML */
+    function _esc(t) {
+      return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    /**
+     * Append a completed transcript line.
+     * Each segment is a two-column row: timestamp | text.
+     */
+    function appendSegment(text) {
+      emptyState.classList.add("hidden");
+
+      const seg = document.createElement("div");
+      seg.className = [
+        "grid grid-cols-[56px_1fr] gap-4",     // timestamp col | text col
+        "py-3 border-b border-border",
+        "animate-fade-up",
+      ].join(" ");
+
+      seg.innerHTML = `
+        <span class="font-mono text-[11px] text-dim pt-0.5 text-right leading-relaxed">
+          ${_timestamp()}
+        </span>
+        <span class="text-base text-zinc-100 leading-relaxed tracking-[-0.01em]">
+          ${_esc(text)}
+        </span>
+      `;
+
+      pane.appendChild(seg);
+      // Scroll so the newest line is always visible
+      pane.scrollTop = pane.scrollHeight;
+    }
+
+    /**
+     * Show a placeholder "transcribing…" line while waiting for the API.
+     * Replaced by appendSegment() when the real text arrives.
+     */
+    function showPartial(text) {
+      clearPartial();  // remove any previous partial first
+
+      partialEl = document.createElement("div");
+      partialEl.className = [
+        "grid grid-cols-[56px_1fr] gap-4",
+        "py-3 border-b border-border",
+      ].join(" ");
+
+      partialEl.innerHTML = `
+        <span class="font-mono text-[11px] text-dim pt-0.5 text-right leading-relaxed">
+          ${_timestamp()}
+        </span>
+        <span class="text-base text-dim leading-relaxed cursor-blink">
+          ${_esc(text)}
+        </span>
+      `;
+
+      pane.appendChild(partialEl);
+      pane.scrollTop = pane.scrollHeight;
+    }
+
+    /** Remove the partial placeholder if one exists. */
+    function clearPartial() {
+      if (partialEl) {
+        partialEl.remove();
+        partialEl = null;
+      }
+    }
+
+    // ── Hint text ─────────────────────────────────────────────────────────────
+
+    function setHint(side, text) {
+      (side === "left" ? hintLeft : hintRight).textContent = text;
+    }
+
+    // ── Recording state ───────────────────────────────────────────────────────
+
+    /** Switch the mic button to its "active recording" look. */
+    function onRecordingStart(stream) {
+      micBtn.classList.add("border-red-500", "bg-red-950");
+      micBtn.classList.remove("border-border", "bg-panel");
+      micIcon.setAttribute("data-lucide", "mic-off");
+      lucide.createIcons();  // re-render icon swap
+      micRing.classList.add("animate-pulse-ring");
+      setHint("right", "recording…");
+      Waveform.start(stream);
+    }
+
+    /** Reset the mic button to its idle look. */
+    function onRecordingStop() {
+      micBtn.classList.remove("border-red-500", "bg-red-950");
+      micBtn.classList.add("border-border", "bg-panel");
+      micIcon.setAttribute("data-lucide", "mic");
+      lucide.createIcons();
+      micRing.classList.remove("animate-pulse-ring");
+      setHint("right", "tap to record");
+      setHint("left", "");
+      Waveform.stop();
+    }
+
+    // ── Clear button ──────────────────────────────────────────────────────────
+
+    clearBtn.addEventListener("click", () => {
+      // Remove all .seg elements from the pane
+      pane.querySelectorAll(".animate-fade-up, .grid").forEach((el) => el.remove());
+      clearPartial();
+      emptyState.classList.remove("hidden");
+    });
+
+    return {
+      setStatus,
+      appendSegment,
+      showPartial,
+      clearPartial,
+      setHint,
+      onRecordingStart,
+      onRecordingStop,
+    };
+  })();
+
+
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │  § INIT                                                          │
+  // │  Wire everything together once the page is ready.               │
+  // └─────────────────────────────────────────────────────────────────┘
+
+  // Render all data-lucide icons declared in the HTML
+  lucide.createIcons();
+
+  // Open the WebSocket connection to the server
+  WSClient.connect();
+
+  // Mic button click → toggle recording
+  document.getElementById("mic-btn").addEventListener("click", () => {
+    AudioCapture.toggle();
+  });
+
+  </script>
+</body>
+</html>
