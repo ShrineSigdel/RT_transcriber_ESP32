@@ -4,4 +4,4 @@
 fastapi==0.115.0          # Web framework — handles HTTP routes and WebSockets
 uvicorn[standard]==0.30.6 # ASGI server that runs FastAPI
 python-multipart==0.0.9   # Required for FastAPI to parse multipart/form-data (file uploads)
-groq==0.11.0              # Official Groq SDK — wraps the Whisper transcription API
+groq==1.4.0               # Official Groq SDK — wraps the Whisper transcription API

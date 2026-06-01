@@ -1,10 +1,8 @@
 """
 config.py
 =========
-Central configuration file for the LiveVoice transcription server.
-
-All tunable settings live here so you never have to hunt through
-multiple files to change a value.  Import this anywhere with:
+Central configuration for the LiveVoice server.
+Change values here — never hunt through other files.
 
     from config import settings
 """
@@ -15,32 +13,34 @@ from dataclasses import dataclass
 
 @dataclass
 class Settings:
+
     # ── Groq API ──────────────────────────────────────────────────────────────
-    # Your Groq API key.  Get one free at https://console.groq.com/keys
-    # Set it as an environment variable so it never ends up in source code:
-    #   export GROQ_API_KEY="gsk_..."
+    # Get a free key at https://console.groq.com/keys
+    # Set in your shell:  export GROQ_API_KEY="gsk_..."
     groq_api_key: str = os.environ.get("GROQ_API_KEY", "")
 
-    # Groq Whisper model to use.
-    # "whisper-large-v3-turbo" is the fastest; good balance of speed & accuracy.
-    # Other options: "whisper-large-v3" (slower, more accurate)
+    # "whisper-large-v3-turbo" → fastest, free tier
+    # "whisper-large-v3"       → more accurate, slower
     groq_model: str = "whisper-large-v3-turbo"
 
-    # Language hint passed to Whisper.
-    # Use a BCP-47 code like "en", "ne" (Nepali), "hi" (Hindi), or "" for auto-detect.
+    # BCP-47 language code: "en", "ne", "hi" — or "" for auto-detect
     language: str = "en"
 
     # ── Server ────────────────────────────────────────────────────────────────
-    # Host and port the FastAPI server listens on.
-    # "0.0.0.0" means it accepts connections from any device on your network,
-    # useful when you want the ESP32 or another device to reach it.
+    # "0.0.0.0" = accept from any device on the network (needed for ESP32)
     host: str = "0.0.0.0"
     port: int = 8000
+    reload: bool = True   # set False in production
 
-    # When True, uvicorn restarts the server on every file save.
-    # Set to False in production.
-    reload: bool = True
+    # ── ESP32 info (not used by server code — just documents what to flash) ──
+    # The ESP32 connects to ws://<your-laptop-LAN-IP>:8000/ws
+    # It is a plain WebSocket client, identical to the browser tab.
+    # No server changes needed — broadcast() already sends to every client.
+    #
+    # To find your LAN IP (the value to put in wifi_config.h on the ESP32):
+    #   Linux/Mac:  ip route get 1 | awk '{print $7; exit}'
+    #   Windows:    ipconfig | findstr "IPv4"
 
 
-# Single shared instance — import this everywhere
+# Single shared instance
 settings = Settings()
